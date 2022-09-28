@@ -60,7 +60,9 @@ struct channel_state {
     bool enabled;
 };
 
-const channel_cfg channel_cfgs[8] = {
+#define CH_NUM 8
+
+const channel_cfg channel_cfgs[CH_NUM] = {
     {160, 20.0, 525.0},
     {80, 20.0, 525.0},
     {80, 20.0, 525.0},
@@ -71,7 +73,7 @@ const channel_cfg channel_cfgs[8] = {
     {0,  0.0,  0.0},
 };
 
-channel_state channel_states[8];
+channel_state channel_states[CH_NUM];
 
 // trim from end (in place)
 static inline void rtrim(std::string &s) {
@@ -129,7 +131,7 @@ void reset_channels() {
     update_shiftreg();
     std::this_thread::sleep_for(std::chrono::microseconds(500));
     //F=500 Hz
-    for(int i = 0; i<165; i++) {
+    for(int i = 0; i<170; i++) {
         chip1_state[1] = 1;
         chip1_state[2] = 1;
         chip1_state[3] = 1;
@@ -180,7 +182,7 @@ void reset_channel(int num) {
         update_shiftreg();
         std::this_thread::sleep_for(std::chrono::microseconds(500));
         //F=400 Hz
-        for(int i = 0; i<channel_cfgs[num].steps_count+5; i++) {
+        for(int i = 0; i<channel_cfgs[num].steps_count+10; i++) {
             chip1_state[1+num] = 1; //STEP=1
             c1lines.set_values(chip1_state);
             std::this_thread::sleep_for(std::chrono::microseconds(1000));
@@ -201,6 +203,9 @@ void reset_channel(int num) {
         channel_states[num].last_time = std::chrono::high_resolution_clock::now();
         channel_states[num].curr_period = (std::chrono::duration<long, std::micro> {0});
         channel_states[num].remapped = false;
+        channel_states[num].enabled = false;
+        channel_states[num].curr_playing_note = 0;
+        channel_states[num].curr_velocity = 0;
 
         chip0_state[2] = 0; //reset transformer
         c0lines.set_values(chip0_state);
@@ -215,6 +220,9 @@ void reset_channel(int num) {
         channel_states[num].last_time = std::chrono::high_resolution_clock::now();
         channel_states[num].curr_period = (std::chrono::duration<long, std::micro> {0});
         channel_states[num].remapped = false;
+        channel_states[num].enabled = false;
+        channel_states[num].curr_playing_note = 0;
+        channel_states[num].curr_velocity = 0;
 
         chip1_state[5] = 0; //reset buzzer
         c1lines.set_values(chip1_state);
@@ -230,7 +238,7 @@ void sequencer_thread_func() {
         bool updatechip0 = false;
         bool updatechip1 = false;
         gpiomtx.try_lock();
-        for(int i = 0; i < 8; i++) {
+        for(int i = 0; i < CH_NUM; i++) {
             if((channel_states[i].curr_phase != 0 || channel_states[i].curr_period.count() != 0) && (std::chrono::high_resolution_clock::now() - channel_states[i].last_time >= channel_states[i].curr_period)) {
                 switch(i) {
                     case 0:
@@ -287,6 +295,8 @@ void sequencer_thread_func() {
                             channel_states[i].enabled = false;
                             channel_states[i].curr_period = std::chrono::high_resolution_clock::duration(0);
                             channel_states[i].curr_phase = 0;
+                            channel_states[i].remapped = 0;
+                            channel_states[i].curr_velocity = 0;
                         }
                         break;
                 }
@@ -313,7 +323,7 @@ void sequencer_thread_func() {
             c1lines.set_values(chip1_state);
         gpiomtx.unlock();
         bool sleep = true;
-        for(int i = 0; i < 8; i++) {
+        for(int i = 0; i < CH_NUM; i++) {
             if(channel_states[i].enabled) {
                 sleep = false;
                 break;
@@ -452,25 +462,76 @@ void clear_channel(int ch) {
 void play_note(int ch, int note, int velocity) {
     double f = midiNoteToFrequency(note);
     long period_us = (1000000L / f);
-    if(ch != 6 && ch != 7) {
+    if(ch >= 8 && ch != 9) {
+        return;
+    }
+    if(ch != 6 && ch != 7 && ch != 9) {
         if((f >= channel_cfgs[ch].min_frequency && f <= channel_cfgs[ch].max_frequency) && (channel_states[ch].remapped || channel_states[ch].curr_playing_note == 0)) {
+            if(verbose)
+                printf("     Channel %d playing note %f\n", ch, f);
             set_channel(ch, period_us, velocity);
             channel_states[ch].curr_playing_note = note;
             channel_states[ch].curr_velocity = velocity;
             channel_states[ch].remapped = false;
         } else if(remappingenabled) {
             //remapping process
+            bool remap = false;
             for(int i = 0; i < 6; i++) {
                 if(channel_states[i].curr_playing_note == 0) {
                     if(f >= channel_cfgs[i].min_frequency && f <= channel_cfgs[i].max_frequency) {
+                        if(verbose)
+                            printf("     Channel %d remapping note %f to %d(currently playing %d)\n", ch, f, i, channel_states[ch].curr_playing_note);
                         set_channel(i, period_us, velocity);
                         channel_states[i].curr_playing_note = note;
                         channel_states[ch].curr_velocity = velocity;
                         channel_states[i].remapped = true;
+                        remap = true;
                         break;
                     }
                 }
             }
+            if(!remap) {
+                if((f >= channel_cfgs[ch].min_frequency && f <= channel_cfgs[ch].max_frequency)) {
+                    if(verbose)
+                        printf("     Channel %d overwriting note %f\n", ch, f);
+                    set_channel(ch, period_us, velocity);
+                    channel_states[ch].curr_playing_note = note;
+                    channel_states[ch].curr_velocity = velocity;
+                    channel_states[ch].remapped = false;
+                }
+            }
+        }
+    } else if(ch == 9) {
+        switch(note) {
+            case 38: //Acoustic Snare
+            case 39: //Hand Clap
+            case 40: //Electric Snare
+            case 42: //Closed Hi Hat 
+            case 44: //Pedal Hi-Hat 
+            case 46: //Open Hi-Hat 
+            case 49: //Crash Cymbal 1
+            case 51: //Ride Cymbal 1
+            case 52: //Chinese Cymbal
+            case 53: //Ride Bell
+            case 55: //Splash Cymbal
+            case 56: //Cowbell
+            case 57: //Crash Cymbal 2
+            case 58: //Vibraslap
+            case 59: //Ride Cymbal 2
+            case 70: //Maracas
+            case 71: //Short Whistle
+            case 72: //Long Whistle
+            case 76: //Hi Wood Block
+            case 77: //Low Wood Block
+            case 80: //Mute Triangle
+            case 81: //Open Triangle
+                //higher drums or cymbals/hats
+                set_channel(6, period_us, velocity);
+                break;
+            default:
+                //drums or other
+                set_channel(7, period_us, velocity);
+                break;
         }
     } else {
         set_channel(ch, period_us, velocity);
@@ -478,6 +539,9 @@ void play_note(int ch, int note, int velocity) {
 }
 
 void stop_note(int ch, int note) {
+    if(ch >= 8 && ch != 9) {
+        return;
+    }
     if(channel_states[ch].curr_playing_note == note && !channel_states[ch].remapped) {
         clear_channel(ch);
         channel_states[ch].curr_playing_note = 0;
@@ -522,6 +586,8 @@ void main_loop() {
             break;
         case SND_SEQ_EVENT_CONTROLLER:
             if(evt->data.control.param == 123 && evt->data.control.value == 0) {
+                if(verbose)
+                        printf("     Channel %d reset\n", evt->data.control.channel);
                 reset_channel(evt->data.control.channel);
             }
             break;
